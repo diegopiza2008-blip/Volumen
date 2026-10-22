@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Volumen DFPlayer</title>
+<style>
+  :root {
+    --bg: #12141a;
+    --panel: #1b1e27;
+    --borde: #2a2e3b;
+    --texto: #eceef4;
+    --suave: #8b91a3;
+    --acento: #4cc2ff;
+    --ok: #4ade80;
+    --error: #ff6b6b;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f2f4f8;
+      --panel: #ffffff;
+      --borde: #dde1ea;
+      --texto: #1a1d26;
+      --suave: #6b7185;
+      --acento: #0a84d6;
+      --ok: #15a34a;
+      --error: #d93636;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    min-height: 100vh;
+    background: var(--bg);
+    color: var(--texto);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    justify-content: center;
+    padding: 24px 16px;
+  }
+  main { width: 100%; max-width: 420px; }
+  h1 { font-size: 1.25rem; margin: 0 0 4px; }
+  .sub { color: var(--suave); font-size: .9rem; margin: 0 0 20px; }
+
+  .tarjeta {
+    background: var(--panel);
+    border: 1px solid var(--borde);
+    border-radius: 18px;
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+  .estado { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  .punto { width: 10px; height: 10px; border-radius: 50%; background: var(--suave); flex: none; }
+  .punto.on { background: var(--ok); }
+  .punto.err { background: var(--error); }
+  #estadoTexto { font-size: .95rem; }
+
+  button {
+    font: inherit;
+    color: inherit;
+    border: 1px solid var(--borde);
+    background: transparent;
+    border-radius: 12px;
+    padding: 12px 16px;
+    cursor: pointer;
+  }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.principal {
+    background: var(--acento);
+    border-color: var(--acento);
+    color: #04121c;
+    font-weight: 600;
+    width: 100%;
+  }
+
+  .lectura { text-align: center; margin: 4px 0 18px; }
+  #volNum { font-size: 4.5rem; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+  #volNum small { font-size: 1.1rem; color: var(--suave); font-weight: 500; }
+
+  input[type=range] { width: 100%; height: 36px; accent-color: var(--acento); margin: 0 0 12px; }
+
+  .botones { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+  .botones button { font-size: 1.1rem; padding: 16px 0; }
+
+  #mensaje { min-height: 1.2em; font-size: .85rem; color: var(--error); margin: 0; }
+  .nota { color: var(--suave); font-size: .8rem; line-height: 1.4; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Volumen DFPlayer</h1>
+  <p class="sub">Control por Bluetooth del ESP32</p>
+
+  <section class="tarjeta">
+    <div class="estado">
+      <span class="punto" id="punto"></span>
+      <span id="estadoTexto">Desconectado</span>
+    </div>
+    <button class="principal" id="btnConectar">Conectar</button>
+  </section>
+
+  <section class="tarjeta">
+    <div class="lectura"><span id="volNum">–<small> / 30</small></span></div>
+    <input type="range" id="slider" min="0" max="30" step="1" value="15" disabled aria-label="Volumen">
+    <div class="botones">
+      <button id="btnMenos" disabled aria-label="Bajar volumen">−</button>
+      <button id="btnMute" disabled>Silencio</button>
+      <button id="btnMas" disabled aria-label="Subir volumen">+</button>
+    </div>
+  </section>
+
+  <p id="mensaje" role="status"></p>
+  <p class="nota">Funciona en Chrome o Edge (Android y escritorio). Safari en iPhone no admite Web Bluetooth; allí se puede usar el navegador Bluefy.</p>
+</main>
+
+<script>
+(function () {
+  const SERVICE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
+  const VOLUME_UUID  = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
+  const VOL_MAX = 30;
+
+  const $ = (id) => document.getElementById(id);
+  const btnConectar = $('btnConectar'), slider = $('slider');
+  const btnMas = $('btnMas'), btnMenos = $('btnMenos'), btnMute = $('btnMute');
+
+  let dispositivo = null;
+  let caracteristica = null;
+  let volumen = 15;
+  let volumenAntesDeSilencio = null;
+  let pendiente = null;      // último volumen aún sin enviar
+  let enviando = false;
+  let arrastrando = false;
+
+  function mensaje(texto) { $('mensaje').textContent = texto || ''; }
+
+  function estado(texto, clase) {
+    $('estadoTexto').textContent = texto;
+    $('punto').className = 'punto' + (clase ? ' ' + clase : '');
+  }
+
+  function controles(activos) {
+    [slider, btnMas, btnMenos, btnMute].forEach((el) => { el.disabled = !activos; });
+  }
+
+  function mostrarVolumen(v) {
+    volumen = v;
+    $('volNum').firstChild.nodeValue = String(v);
+    slider.value = String(v);
+  }
+
+  function limitar(v) { return Math.max(0, Math.min(VOL_MAX, Math.round(v))); }
+
+  // ---- Envío al ESP32 (una escritura a la vez, siempre el último valor) ----
+  function pedirVolumen(v) {
+    v = limitar(v);
+    pendiente = v;
+    mostrarVolumen(v);
+    vaciarCola();
+  }
+
+  async function vaciarCola() {
+    if (enviando || !caracteristica) return;
+    enviando = true;
+    try {
+      while (pendiente !== null) {
+        const v = pendiente;
+        pendiente = null;
+        await caracteristica.writeValue(Uint8Array.of(v));
+      }
+      mensaje('');
+    } catch (e) {
+      pendiente = null;
+      mensaje('No se pudo enviar el volumen: ' + e.message);
+    } finally {
+      enviando = false;
+    }
+  }
+
+  // ---- Conexión ----
+  async function abrirGatt() {
+    estado('Conectando…');
+    const servidor = await dispositivo.gatt.connect();
+    const servicio = await servidor.getPrimaryService(SERVICE_UUID);
+    caracteristica = await servicio.getCharacteristic(VOLUME_UUID);
+
+    caracteristica.addEventListener('characteristicvaluechanged', (e) => {
+      // Ignora el eco mientras el usuario mueve el control
+      if (arrastrando || enviando || pendiente !== null) return;
+      mostrarVolumen(limitar(e.target.value.getUint8(0)));
+    });
+    await caracteristica.startNotifications();
+
+    const inicial = await caracteristica.readValue();
+    mostrarVolumen(limitar(inicial.getUint8(0)));
+
+    estado('Conectado a ' + (dispositivo.name || 'ESP32'), 'on');
+    btnConectar.textContent = 'Desconectar';
+    controles(true);
+    mensaje('');
+  }
+
+  function alDesconectar() {
+    caracteristica = null;
+    pendiente = null;
+    controles(false);
+    estado('Desconectado', 'err');
+    btnConectar.textContent = 'Reconectar';
+  }
+
+  async function conectar() {
+    if (!navigator.bluetooth) {
+      estado('Bluetooth no disponible', 'err');
+      mensaje('Este navegador no admite Web Bluetooth. Usa Chrome o Edge, y abre la página por HTTPS.');
+      return;
+    }
+    btnConectar.disabled = true;
+    mensaje('');
+    try {
+      if (dispositivo) {
+        try {
+          await abrirGatt();
+          return;
+        } catch (e) {
+          dispositivo = null;   // el dispositivo ya no responde: se vuelve a buscar
+        }
+      }
+      estado('Buscando…');
+      dispositivo = await navigator.bluetooth.requestDevice({
+        filters: [{ services: [SERVICE_UUID] }]
+      });
+      dispositivo.addEventListener('gattserverdisconnected', alDesconectar);
+      await abrirGatt();
+    } catch (e) {
+      if (e.name === 'NotFoundError') {
+        estado('Desconectado');
+        mensaje('No se eligió ningún dispositivo.');
+      } else {
+        estado('Error de conexión', 'err');
+        mensaje(e.message);
+      }
+      btnConectar.textContent = dispositivo ? 'Reconectar' : 'Conectar';
+    } finally {
+      btnConectar.disabled = false;
+    }
+  }
+
+  function desconectar() {
+    if (dispositivo && dispositivo.gatt.connected) dispositivo.gatt.disconnect();
+  }
+
+  btnConectar.addEventListener('click', () => {
+    if (dispositivo && dispositivo.gatt.connected) desconectar();
+    else conectar();
+  });
+
+  // ---- Controles ----
+  slider.addEventListener('pointerdown', () => { arrastrando = true; });
+  slider.addEventListener('pointerup', () => { arrastrando = false; });
+  slider.addEventListener('pointercancel', () => { arrastrando = false; });
+  slider.addEventListener('input', () => {
+    volumenAntesDeSilencio = null;
+    btnMute.textContent = 'Silencio';
+    pedirVolumen(Number(slider.value));
+  });
+
+  btnMas.addEventListener('click', () => {
+    volumenAntesDeSilencio = null;
+    btnMute.textContent = 'Silencio';
+    pedirVolumen(volumen + 1);
+  });
+  btnMenos.addEventListener('click', () => {
+    volumenAntesDeSilencio = null;
+    btnMute.textContent = 'Silencio';
+    pedirVolumen(volumen - 1);
+  });
+
+  btnMute.addEventListener('click', () => {
+    if (volumenAntesDeSilencio === null) {
+      volumenAntesDeSilencio = volumen;
+      btnMute.textContent = 'Quitar silencio';
+      pedirVolumen(0);
+    } else {
+      const v = volumenAntesDeSilencio;
+      volumenAntesDeSilencio = null;
+      btnMute.textContent = 'Silencio';
+      pedirVolumen(v);
+    }
+  });
+
+  if (!navigator.bluetooth) {
+    estado('Bluetooth no disponible', 'err');
+    mensaje('Este navegador no admite Web Bluetooth. Usa Chrome o Edge.');
+    btnConectar.disabled = true;
+  }
+})();
+</script>
+</body>
+</html>
